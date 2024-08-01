@@ -309,7 +309,151 @@ main (int argc, char *argv[])
   const char *root_mountpoint = realpath (root_arg, NULL);
   if (root_mountpoint == NULL)
     err (EXIT_FAILURE, "realpath(\"%s\")", root_arg);
+
+  /* In the signed composefs case, we do not read the 'ostree' parameter from
+   * the command line and instead we look for a commit signed with a matching key */
+  bool found_composefs_commit = false;
+  if (composefs_config->is_signed)
+    {
+      const char *composefs_pubkey = composefs_config->signature_pubkey;
+
+      g_auto (GLnxDirFdIterator) dfditer = {
+        0,
+      };
+      glnx_autofd int sysroot_fd = -1;
+      if (!glnx_opendirat (AT_FDCWD, "/sysroot", FALSE, &sysroot_fd, &error))
+        errx (EXIT_FAILURE, "Failed to open /sysroot: %s", error->message);
+      if (!glnx_dirfd_iterator_init_at (sysroot_fd, "ostree", TRUE, &dfditer, &error))
+        errx (EXIT_FAILURE, "Could not open /sysroot/ostree: %s", error->message);
+      while (TRUE)
+        {
+          struct dirent *dent;
+          if (!glnx_dirfd_iterator_next_dent (&dfditer, &dent, NULL, &error))
+            errx (EXIT_FAILURE, "Unexpected cancel");
+          if (dent == NULL)
+            break;
+          g_print ("Looking at: %s\n", dent->d_name);
+          if (g_str_equal (dent->d_name, "boot.0") || g_str_equal (dent->d_name, "boot.1"))
+            {
+              g_auto (GLnxDirFdIterator) dfditer2 = {
+                0,
+              };
+              char ostreepath[PATH_MAX];
+              if (snprintf (ostreepath, sizeof (ostreepath), "ostree/%s", dent->d_name) < 0)
+                err (EXIT_FAILURE, "failed to assemble ostree target path");
+              if (!glnx_dirfd_iterator_init_at (sysroot_fd, ostreepath, TRUE, &dfditer2, &error))
+                errx (EXIT_FAILURE, "Could not open /%s: %s", ostreepath, error->message);
+              while (TRUE)
+                {
+                  struct dirent *dent2;
+                  if (!glnx_dirfd_iterator_next_dent (&dfditer2, &dent2, NULL, &error))
+                    errx (EXIT_FAILURE, "Unexpected cancel");
+                  if (dent2 == NULL)
+                    break;
+                  g_print ("Looking at: %s\n", dent->d_name);
+                  g_auto (GLnxDirFdIterator) dfditer3 = {
+                    0,
+                  };
+                  char ostreepath2[PATH_MAX];
+                  if (snprintf (ostreepath2, sizeof (ostreepath2), "ostree/%s/%s", dent->d_name, dent2->d_name) < 0)
+                    err (EXIT_FAILURE, "failed to assemble ostree target path");
+                  if (!glnx_dirfd_iterator_init_at (sysroot_fd, ostreepath2, TRUE, &dfditer3, &error))
+                    errx (EXIT_FAILURE, "Could not open /%s: %s", ostreepath2, error->message);
+                  while (TRUE)
+                    {
+                      struct dirent *dent3;
+                      if (!glnx_dirfd_iterator_next_dent (&dfditer3, &dent3, NULL, &error))
+                        errx (EXIT_FAILURE, "Unexpected cancel");
+                      if (dent3 == NULL)
+                        break;
+                      g_print ("Looking at: %s\n", dent3->d_name);
+                      char try_deploy_path[PATH_MAX];
+                      if (snprintf (try_deploy_path, sizeof (try_deploy_path), "/ostree/%s/%s/%s", dent->d_name, dent2->d_name, dent3->d_name) < 0)
+                        err (EXIT_FAILURE, "failed to assemble ostree target path");
+                      g_autoptr (GError) local_error = NULL;
+                      g_autoptr (GVariant) commit = NULL;
+                      g_autoptr (GVariant) commitmeta = NULL;
+
+                      if (!load_commit_for_deploy (root_mountpoint, try_deploy_path, &commit, &commitmeta,
+                                                    &local_error))
+                        {
+                          g_print ("Error loading signatures from repo: %s", local_error->message);
+                          break;
+                        }
+
+                      g_autoptr (GVariant) signatures = g_variant_lookup_value (
+                          commitmeta, OSTREE_SIGN_METADATA_ED25519_KEY, G_VARIANT_TYPE ("aay"));
+                      if (signatures == NULL)
+                        {
+                          g_print ("Signature validation requested, but no signatures in commit");
+                          break;
+                        }
+
+                      g_autoptr (GBytes) commit_data = g_variant_get_data_as_bytes (commit);
+                      if (!validate_signature (commit_data, signatures, composefs_config->pubkeys))
+                        {
+                          g_print ("No valid signatures found for public key");
+                          break;
+                        }
+
+                      g_print ("composefs+ostree: Validated commit signature using '%s'\n", composefs_pubkey);
+                      //
+                      GVariantBuilder metadata_builder;
+                      g_variant_builder_init (&metadata_builder, G_VARIANT_TYPE ("a{sv}"));
+                      //
+                      g_variant_builder_add (&metadata_builder, "{sv}",
+                                              OTCORE_RUN_BOOTED_KEY_COMPOSEFS_SIGNATURE,
+                                              g_variant_new_string (composefs_pubkey));
+
+                      g_autoptr (GVariant) metadata = g_variant_get_child_value (commit, 0);
+                      g_autoptr (GVariant) cfs_digest_v = g_variant_lookup_value (
+                          metadata, OSTREE_COMPOSEFS_DIGEST_KEY_V0, G_VARIANT_TYPE_BYTESTRING);
+                      if (cfs_digest_v == NULL || g_variant_get_size (cfs_digest_v) != OSTREE_SHA256_DIGEST_LEN)
+                        {
+                          g_print ("Signature validation requested, but no valid digest in commit");
+                          break;
+                        }
+
+                      const guint8 *cfs_digest_buf = ot_variant_get_data (cfs_digest_v, &error);
+                      if (!cfs_digest_buf)
+                        {
+                          g_print ("Failed to query digest: %s", error->message);
+                          break;
+                        }
+
+                      g_autofree char *expected_digest = NULL;
+                      expected_digest = g_malloc (OSTREE_SHA256_STRING_LEN + 1);
+                      ot_bin2hex (expected_digest, cfs_digest_buf, g_variant_get_size (cfs_digest_v));
+
+                      const char *objdirs[] = { "/sysroot/ostree/repo/objects" };
+                      g_autofree char *cfs_digest = NULL;
+                      struct lcfs_mount_options_s cfs_options = {
+                        objdirs,
+                        1,
+                      };
+
+                      cfs_options.flags = 0;
+                      cfs_options.image_mountdir = OSTREE_COMPOSEFS_LOWERMNT;
+                      if (mkdirat (AT_FDCWD, OSTREE_COMPOSEFS_LOWERMNT, 0700) < 0)
+                        err (EXIT_FAILURE, "Failed to create %s", OSTREE_COMPOSEFS_LOWERMNT);
+
+                      cfs_options.flags |= LCFS_MOUNT_FLAGS_REQUIRE_VERITY;
+                      g_print ("composefs: Verifying digest: %s\n", expected_digest);
+                      cfs_options.expected_fsverity_digest = expected_digest;
+
+                      found_composefs_commit = true;
+                      goto composefs_success;
+                    }
+                }
+            }
+        }
+    }
+  if (!found_composefs_commit)
+    g_print("Could not find a matching composefs commit\n");
+
   g_autofree char *deploy_path = resolve_deploy_path (kernel_cmdline, root_mountpoint);
+  composefs_success:
+
   const char *deploy_directory_name = glnx_basename (deploy_path);
   // Note that realpath() should have stripped any trailing `/` which shouldn't
   // be in the karg to start with, but we assert here to be sure we have a non-empty
@@ -413,48 +557,6 @@ main (int argc, char *argv[])
       else
         {
           cfs_options.flags = LCFS_MOUNT_FLAGS_READONLY;
-        }
-
-      if (composefs_config->is_signed)
-        {
-          const char *composefs_pubkey = composefs_config->signature_pubkey;
-          g_autoptr (GError) local_error = NULL;
-          g_autoptr (GVariant) commit = NULL;
-          g_autoptr (GVariant) commitmeta = NULL;
-
-          if (!load_commit_for_deploy (root_mountpoint, deploy_path, &commit, &commitmeta,
-                                       &local_error))
-            errx (EXIT_FAILURE, "Error loading signatures from repo: %s", local_error->message);
-
-          g_autoptr (GVariant) signatures = g_variant_lookup_value (
-              commitmeta, OSTREE_SIGN_METADATA_ED25519_KEY, G_VARIANT_TYPE ("aay"));
-          if (signatures == NULL)
-            errx (EXIT_FAILURE, "Signature validation requested, but no signatures in commit");
-
-          g_autoptr (GBytes) commit_data = g_variant_get_data_as_bytes (commit);
-          if (!validate_signature (commit_data, signatures, composefs_config->pubkeys))
-            errx (EXIT_FAILURE, "No valid signatures found for public key");
-
-          g_print ("composefs+ostree: Validated commit signature using '%s'\n", composefs_pubkey);
-          g_variant_builder_add (&metadata_builder, "{sv}",
-                                 OTCORE_RUN_BOOTED_KEY_COMPOSEFS_SIGNATURE,
-                                 g_variant_new_string (composefs_pubkey));
-
-          g_autoptr (GVariant) metadata = g_variant_get_child_value (commit, 0);
-          g_autoptr (GVariant) cfs_digest_v = g_variant_lookup_value (
-              metadata, OSTREE_COMPOSEFS_DIGEST_KEY_V0, G_VARIANT_TYPE_BYTESTRING);
-          if (cfs_digest_v == NULL || g_variant_get_size (cfs_digest_v) != OSTREE_SHA256_DIGEST_LEN)
-            errx (EXIT_FAILURE, "Signature validation requested, but no valid digest in commit");
-          const guint8 *cfs_digest_buf = ot_variant_get_data (cfs_digest_v, &error);
-          if (!cfs_digest_buf)
-            errx (EXIT_FAILURE, "Failed to query digest: %s", error->message);
-
-          expected_digest = g_malloc (OSTREE_SHA256_STRING_LEN + 1);
-          ot_bin2hex (expected_digest, cfs_digest_buf, g_variant_get_size (cfs_digest_v));
-
-          cfs_options.flags |= LCFS_MOUNT_FLAGS_REQUIRE_VERITY;
-          g_print ("composefs: Verifying digest: %s\n", expected_digest);
-          cfs_options.expected_fsverity_digest = expected_digest;
         }
 
       if (lcfs_mount_image (OSTREE_COMPOSEFS_NAME, TMP_SYSROOT, &cfs_options) == 0)
